@@ -1,0 +1,597 @@
+---
+title: "Statistical Rethinking 2: Chapter 14"
+author: Vincent Arel-Bundock
+output: html_document
+---
+
+# Status
+
+Estimated and checked against the book:
+
+* m14.1
+* m14.2
+* m14.3
+* m14.4
+* m14.5
+* m14.6
+* m14.7
+* m14.8
+* m14.9
+* m14.10
+* m14.11
+
+# Libraries
+
+```{r, include=FALSE}
+# set default graphics theme if Vincent's personal package is installed
+if (requireNamespace('vincent', quietly = TRUE)) {
+        vincent::theming()
+}
+```
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+library(tidybayes)
+library(rstan)
+library(patchwork)
+library(rethinking)
+library(tidyverse)
+library(ape)
+options(mc.cores = 4)
+```
+
+# Section 14.1: Varying slopes by construction
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+# Simulation code from McElreath's replication files
+library(MASS)
+a <- 3.5            # average morning wait time
+b <- (-1)           # average difference afternoon wait time
+sigma_a <- 1        # std dev in intercepts
+sigma_b <- 0.5      # std dev in slopes
+rho <- (-0.7)       # correlation between intercepts and slopes
+Mu <- c( a , b )
+cov_ab <- sigma_a*sigma_b*rho
+Sigma <- matrix( c(sigma_a^2,cov_ab,cov_ab,sigma_b^2) , ncol=2 )
+sigmas <- c(sigma_a,sigma_b) # standard deviations
+Rho <- matrix( c(1,rho,rho,1) , nrow=2 ) # correlation matrix
+Sigma <- diag(sigmas) %*% Rho %*% diag(sigmas)
+N_cafes <- 20
+set.seed(5) # used to replicate example
+vary_effects <- mvrnorm( N_cafes , Mu , Sigma )
+a_cafe <- vary_effects[,1]
+b_cafe <- vary_effects[,2]
+set.seed(22)
+N_visits <- 10
+afternoon <- rep(0:1,N_visits*N_cafes/2)
+cafe_id <- rep( 1:N_cafes , each=N_visits )
+mu <- a_cafe[cafe_id] + b_cafe[cafe_id]*afternoon
+sigma <- 0.5  # std dev within cafes
+wait <- rnorm( N_visits*N_cafes , mu , sigma )
+d <- data.frame( cafe=cafe_id , afternoon=afternoon , wait=wait )
+
+stan_data <- compose_data(d,
+ 		                  n_cafe = n_distinct(cafe))
+
+stan_program <- "
+data {
+  int n;
+  int n_cafe;
+  int cafe[n];
+  vector[n] afternoon;
+  vector[n] wait;
+}
+parameters {
+  vector[n_cafe] a_cafe;
+  vector[n_cafe] b_cafe;
+  real a;
+  real b;
+  vector<lower=0>[2] sigma_cafe;
+  real<lower=0> sigma;
+  corr_matrix[2] Rho;
+}
+model {
+  vector[n] mu;
+  vector[2] YY[n_cafe];
+  vector[2] MU;
+  Rho ~ lkj_corr(2);
+  sigma ~ exponential(1);
+  sigma_cafe ~ exponential(1);
+  a ~ normal(5, 2);
+  b ~ normal(-1, .5);
+  MU = [a, b]';
+  for (j in 1:n_cafe) {
+    YY[j] = [a_cafe[j], b_cafe[j]]';
+  }
+  YY ~ multi_normal(MU, quad_form_diag(Rho, sigma_cafe));
+  mu = a_cafe[cafe] + b_cafe[cafe] .* afternoon;
+  wait ~ normal(mu, sigma);
+}
+"
+
+m14.1 <- stan(model_code = stan_program, data = stan_data)
+
+datplot <- m14.1 %>% 
+           spread_draws(Rho[i, j]) %>%
+           filter(i == 1, j == 2)
+
+ggplot(datplot, aes(Rho)) +
+    geom_density() +
+    xlim(-1, 1) +
+    xlab('Correlation')
+```
+
+# Section 14.2: Advanced varying slopes
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+
+stan_data <- read.csv('data/chimpanzees.csv', sep = ';') %>%
+             mutate(treatment = 1 + prosoc_left + 2 * condition) %>%
+             rename(block_id = block) %>%
+             compose_data(n_treatment = n_distinct(treatment),
+                          n_actor = n_distinct(actor),
+                          n_block_id = n_distinct(block_id))
+
+stan_program <- "
+data {
+    int n;
+    int n_treatment;
+    int n_actor;
+    int n_block_id;
+    int pulled_left[n];
+    int actor[n];
+    int treatment[n];
+    int block_id[n];
+}
+parameters {
+   vector[n_treatment] g; 
+   vector[n_treatment] alpha[n_actor];
+   vector[n_treatment] beta[n_block_id];
+   vector<lower=0>[4] sigma_actor;
+   vector<lower=0>[4] sigma_block;
+   corr_matrix[4] Rho_block;
+   corr_matrix[4] Rho_actor;
+}
+model {
+    // probability model
+    vector[n] p;
+    for (i in 1:n) {
+        p[i] = g[treatment[i]] + 
+               alpha[actor[i], treatment[i]] + 
+               beta[block_id[i], treatment[i]];
+        p[i] = inv_logit(p[i]);
+    }
+    pulled_left ~ binomial(1, p);
+
+    // adaptive priors
+    beta ~ multi_normal(rep_vector(0, 4),
+                        quad_form_diag(Rho_block, sigma_block));
+    alpha ~ multi_normal(rep_vector(0, 4),
+                         quad_form_diag(Rho_actor, sigma_actor));
+
+    // fixed priors
+    g ~ normal(0, 1);
+    Rho_actor ~ lkj_corr(4);
+    Rho_block ~ lkj_corr(4);
+    sigma_actor ~ exponential(1);
+    sigma_block ~ exponential(1);
+}
+"
+
+m14.2 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+stan_program <- "
+data {
+    int n;
+    int n_treatment;
+    int n_actor;
+    int n_block_id;
+    int pulled_left[n];
+    int actor[n];
+    int treatment[n];
+    int block_id[n];
+}
+parameters {
+   matrix[n_treatment, n_actor] z_actor;
+   matrix[n_treatment, n_block_id] z_block;
+   vector[n_treatment] g; 
+   vector<lower=0>[n_treatment] sigma_actor;
+   vector<lower=0>[n_treatment] sigma_block;
+   cholesky_factor_corr[n_treatment] L_Rho_block;
+   cholesky_factor_corr[n_treatment] L_Rho_actor;
+}
+transformed parameters {
+   matrix[n_actor, n_treatment] alpha;
+   matrix[n_block_id, n_treatment] beta;
+   beta = (diag_pre_multiply(sigma_block, L_Rho_block) * z_block)';
+   alpha = (diag_pre_multiply(sigma_actor, L_Rho_actor) * z_actor)';
+}
+model{
+    vector[n] p;
+    L_Rho_block ~ lkj_corr_cholesky( 2 );
+    sigma_block ~ exponential( 1 );
+    L_Rho_actor ~ lkj_corr_cholesky( 2 );
+    sigma_actor ~ exponential( 1 );
+    g ~ normal( 0 , 1 );
+    to_vector( z_block ) ~ normal( 0 , 1 );
+    to_vector( z_actor ) ~ normal( 0 , 1 );
+    for ( i in 1:n ) {
+        p[i] = g[treatment[i]] + alpha[actor[i], treatment[i]] + beta[block_id[i], treatment[i]];
+        p[i] = inv_logit(p[i]);
+    }
+    pulled_left ~ binomial( 1 , p );
+}
+"
+
+m14.3 <- stan(model_code = stan_program, data = stan_data)
+```
+
+# Section 14:3: Instruments and causal designs
+
+Zero true effect of E is confounded:
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+set.seed(73)
+N <- 500
+U_sim <- rnorm( N )
+Q_sim <- sample( 1:4 , size=N , replace=TRUE )
+E_sim <- rnorm( N , U_sim + Q_sim )
+W_sim <- rnorm( N , U_sim + 0*E_sim )
+stan_data <- list(
+    W = as.vector(scale(W_sim)),
+    E = as.vector(scale(E_sim)),
+    Q = as.vector(scale(Q_sim)),
+    N = N)
+
+stan_program <- '
+data{
+    int N;
+    vector[N] W;
+    vector[N] E;
+    vector[N] Q;
+}
+parameters {
+    real aW;
+    real bEW;
+    real<lower=0> sigma;
+}
+model {
+    vector[N] mu;
+    mu = aW + bEW * E;
+    W ~ normal(mu, sigma);
+    aW ~ normal(0, .2);
+    bEW ~ normal(0, .5);
+    sigma ~ exponential(1);
+}
+'
+
+m14.4 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.4
+```
+
+Controlling for the instrument leads to disaster:
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+stan_program <- '
+data{
+    int N;
+    vector[N] W;
+    vector[N] E;
+    vector[N] Q;
+}
+parameters {
+    real aW;
+    real bEW;
+    real bQW;
+    real<lower=0> sigma;
+}
+model {
+    vector[N] mu;
+    mu = aW + bEW * E + bQW * Q;
+    W ~ normal(mu, sigma);
+    aW ~ normal(0, .2);
+    bEW ~ normal(0, .5);
+    bQW ~ normal(0, .5);
+    sigma ~ exponential(1);
+}
+'
+
+m14.5 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.5
+```
+
+Instrumental variable model:
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+stan_program <- "
+data{
+    int N;
+    vector[N] W;
+    vector[N] E;
+    vector[N] Q;
+}
+parameters {
+    real aE;
+    real aW;
+    real bEW;
+    real bQE;
+    corr_matrix[2] Rho;
+    vector<lower=0>[2] Sigma;
+}
+model {
+    vector[2] MU[N];
+    vector[2] YY[N];
+    vector[N] mu_w;
+    vector[N] mu_e;
+    Sigma ~ exponential(1);
+    Rho ~ lkj_corr(2);
+    bQE ~ normal(0, .5);
+    bEW ~ normal(0, .5);
+    aW ~ normal(0, .2);
+    aE ~ normal(0, .2);
+    for (j in 1:N) {
+        mu_w[j] = aW + bEW * E[j];
+        mu_e[j] = aE + bQE * Q[j];
+    }
+    for (j in 1:N) {
+        MU[j] = [mu_w[j], mu_e[j]]';
+        YY[j] = [W[j], E[j]]';
+    }
+    YY ~ multi_normal(MU, quad_form_diag(Rho, Sigma));
+}
+"
+
+m14.6 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.6
+```
+
+### m14.7
+
+```{r}
+
+load('data/KosterLeckie.rda') 
+stan_data <- kl_dyads %>%
+             compose_data(n_households = max(hidB))
+
+stan_program <- "
+data {
+  int n;
+  int n_households;
+  int hidA[n];
+  int hidB[n];
+  int giftsAB[n];
+  int giftsBA[n];
+  int did[n];
+}
+parameters{
+    real a;
+    vector[2] gr[n_households];
+    corr_matrix[2] Rho_gr;
+    vector<lower=0>[2] sigma_gr;
+    matrix[2,n] z;
+    cholesky_factor_corr[2] L_Rho_d;
+    real<lower=0> sigma_d;
+}
+transformed parameters{
+    matrix[n,2] d;
+    d = (diag_pre_multiply(rep_vector(sigma_d, 2), L_Rho_d) * z)';
+}
+model{
+    vector[n] lambdaAB;
+    vector[n] lambdaBA;
+    sigma_d ~ exponential( 1 );
+    L_Rho_d ~ lkj_corr_cholesky( 8 );
+    to_vector( z ) ~ normal( 0 , 1 );
+    sigma_gr ~ exponential( 1 );
+    Rho_gr ~ lkj_corr( 4 );
+    gr ~ multi_normal( rep_vector(0,2) , quad_form_diag(Rho_gr , sigma_gr) );
+    a ~ normal( 0 , 1 );
+    for ( i in 1:n ) {
+        lambdaBA[i] = a + gr[hidB[i], 1] + gr[hidA[i], 2] + d[did[i], 2];
+        lambdaBA[i] = exp(lambdaBA[i]);
+        lambdaAB[i] = a + gr[hidA[i], 1] + gr[hidB[i], 2] + d[did[i], 1];
+        lambdaAB[i] = exp(lambdaAB[i]);
+    }
+    giftsBA ~ poisson( lambdaBA );
+    giftsAB ~ poisson( lambdaAB );
+}
+"
+m14.7 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m14.7, c('Rho_gr', 'sigma_gr'))$summary
+```
+
+# Section 14.5: Continuous categories and the Gaussian process
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+load('data/islandsDistMatrix.rda')
+stan_data <- read.csv('data/Kline2.csv', sep = ';') %>%
+             mutate(society = 1:10) %>%
+             compose_data(Dmat = islandsDistMatrix)
+
+stan_program <- "
+// cov_GPL2 macro extracted from ulam object with get_stancode
+functions{
+    matrix cov_GPL2(matrix x, real sq_alpha, real sq_rho, real delta) {
+        int N = dims(x)[1];
+        matrix[N, N] K;
+        for (i in 1:(N-1)) {
+          K[i, i] = sq_alpha + delta;
+          for (j in (i + 1):N) {
+            K[i, j] = sq_alpha * exp(-sq_rho * square(x[i,j]) );
+            K[j, i] = K[i, j];
+          }
+        }
+        K[N, N] = sq_alpha + delta;
+        return K;
+    }
+}
+data {
+    int n;
+    int total_tools[n];
+    int population[n];
+    int society[n];
+    matrix[n, n] Dmat;
+}
+parameters {
+    vector[n] k;
+    real<lower=0> a;
+    real<lower=0> b;
+    real<lower=0> g;
+    real<lower=0> etasq;
+    real<lower=0> rhosq;
+}
+model{
+    vector[n] lambda;
+    matrix[n, n] SIGMA;
+    rhosq ~ exponential( 0.5 );
+    etasq ~ exponential( 2 );
+    a ~ exponential( 1 );
+    b ~ exponential( 1 );
+    g ~ exponential( 1 );
+    SIGMA = cov_GPL2(Dmat, etasq, rhosq, 0.01);
+    k ~ multi_normal( rep_vector(0,n) , SIGMA );
+    for ( i in 1:n ) {
+        lambda[i] = (a * population[i]^b/g) * exp(k[society[i]]);
+    }
+    total_tools ~ poisson( lambda );
+}
+"
+
+m14.8 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+standardize <- function(x) as.vector(scale(x))
+dat <- read.csv('data/Primates301.csv', sep = ';') %>%
+             dplyr::select(name, mass = body, brain, group_size) %>%
+             drop_na %>%
+             mutate(mass = standardize(log(mass)),
+                    brain = standardize(log(brain)),
+                    group_size = standardize(log(group_size))) 
+stan_data <- dat %>%
+             compose_data(Dmat = diag(nrow(.)))
+
+stan_program <- "
+data{
+    int n;
+    vector[n] mass;
+    vector[n] brain;
+    vector[n] group_size;
+    matrix[n, n] Dmat;
+}
+parameters{
+    real a;
+    real bG;
+    real bM;
+    real<lower=0> sigma_sq;
+}
+model{
+    vector[n] mu;
+    matrix[n, n] S;
+    sigma_sq ~ exponential( 1 );
+    bM ~ normal( 0 , 0.5 );
+    bG ~ normal( 0 , 0.5 );
+    a ~ normal( 0 , 1 );
+    S = Dmat * sigma_sq;
+    for ( i in 1:n ) {
+        mu[i] = a + bM * mass[i] + bG * group_size[i];
+    }
+    brain ~ multi_normal( mu , S);
+}
+"
+
+m14.9 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.9
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+library(ape)
+data(Primates301_nex)
+
+tree_trimmed <- keep.tip( Primates301_nex, dat$name )
+Rbm <- corBrownian( phy=tree_trimmed )
+V <- vcv(Rbm)
+Dmat <- cophenetic( tree_trimmed )
+
+stan_data <- compose_data(dat,
+                          V = V[dat$name, dat$name],
+                          Dmat = V / max(V))
+
+m14.10 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.10
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+
+stan_program <- "
+functions{
+    matrix cov_GPL1(matrix x, real sq_alpha, real sq_rho, real delta) {
+        int N = dims(x)[1];
+        matrix[N, N] K;
+        for (i in 1:(N-1)) {
+          K[i, i] = sq_alpha + delta;
+          for (j in (i + 1):N) {
+            K[i, j] = sq_alpha * exp(-sq_rho * x[i,j] );
+            K[j, i] = K[i, j];
+          }
+        }
+        K[N, N] = sq_alpha + delta;
+        return K;
+    }
+}
+data{
+    int n;
+    vector[n] mass;
+    vector[n] brain;
+    vector[n] group_size;
+    matrix[n,n] Dmat;
+}
+parameters{
+    real a;
+    real bG;
+    real bM;
+    real<lower=0> etasq;
+    real<lower=0> rhosq;
+}
+model{
+    vector[n] mu;
+    matrix[n, n] SIGMA;
+    rhosq ~ normal( 3 , 0.25 );
+    etasq ~ normal( 1 , 0.25 );
+    bM ~ normal( 0 , 0.5 );
+    bG ~ normal( 0 , 0.5 );
+    a ~ normal( 0 , 1 );
+    SIGMA = cov_GPL1(Dmat, etasq, rhosq, 0.01);
+    for ( i in 1:n ) {
+        mu[i] = a + bM * mass[i] + bG * group_size[i];
+    }
+    brain ~ multi_normal( mu , SIGMA );
+}
+"
+
+stan_data$Dmat <- Dmat[dat$name, dat$name] / max(Dmat)
+m14.11 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+m14.11
+```

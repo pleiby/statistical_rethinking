@@ -1,0 +1,446 @@
+---
+title: "Statistical Rethinking 2: Chapter 13"
+author: Vincent Arel-Bundock
+output: html_document
+---
+
+# Status
+
+Estimated and checked against the book:
+
+* m13.1
+* m13.2
+* m13.3
+* m13.4
+* m13.5
+* m13.6
+* m13.7
+* m13.7nc
+* m13.4nc
+
+# Libraries
+
+```{r, include=FALSE}
+# set default graphics theme if Vincent's personal package is installed
+if (requireNamespace('vincent', quietly = TRUE)) {
+        vincent::theming()
+}
+```
+
+```{r, results=FALSE, message=FALSE}
+library(tidyverse)
+library(tidybayes)
+library(rstan)
+library(rethinking)
+library(patchwork)
+options(mc.cores = 4)
+```
+
+# Section 13:1: Multilevel tadpoles
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+dat <- read.csv('data/reedfrogs.csv', sep = ';')
+stan_data <- list(n = nrow(dat),
+                  surv = dat$surv,
+                  dens = dat$density,
+                  tank = 1:nrow(dat))
+
+stan_program <- '
+data {
+    int n;
+    int surv[n];
+    int dens[n];
+    int tank[n];
+}
+parameters {
+    real a[n];
+}
+transformed parameters {
+    vector[n] p;
+    for (i in 1:n) {
+        p[i] = inv_logit(a[i]);
+    }
+}
+model {
+    a ~ normal(0, 1.5);
+    for (i in 1:n) {
+        surv[i] ~ binomial(dens[i], p[i]);
+    }
+}
+'
+
+m13.1 <- stan(model_code = stan_program, data = stan_data)
+
+stan_program <- '
+data {
+    int n;
+    int surv[n];
+    int dens[n];
+    int tank[n];
+}
+parameters {
+    real abar;
+    real<lower=0> sigma;
+    real a[n];
+}
+transformed parameters {
+    vector[n] p;
+    for (i in 1:n) {
+        p[i] = inv_logit(a[i]);
+    }
+}
+model {
+    a ~ normal(abar, sigma);
+    sigma ~ exponential(1);
+    for (i in 1:n) {
+        surv[i] ~ binomial(dens[i], p[i]);
+    }
+}
+'
+
+m13.2 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r, out.width = '100%', fig.asp = .5}
+
+datplot <- tibble(Tank = 1:nrow(dat),
+                  Density = dat$density,
+                  'Observed' = dat$propsurv,
+                  `No pooling` = summary(m13.1, 'p')$summary[, 1],
+                  `Partial pooling` = summary(m13.2, 'p')$summary[, 1]) %>%
+           mutate(Size = case_when(Density == 10 ~ 'Small',
+                                   Density == 25 ~ 'Medium',
+                                   Density == 35 ~ 'Large'),
+                  Size = factor(Size, c('Small', 'Medium', 'Large'))) %>%
+           pivot_longer(-c(Tank, Size, Density))
+
+ggplot(datplot, aes(Tank, value, color = name)) +
+    geom_point(size = 2) +
+    facet_grid(. ~ Size, scales = 'free_x') +
+    ylab('Survival proportion')
+```
+
+```{r, out.width='100%', fig.asp = .6}
+
+post <- m13.2 %>%
+        spread_draws(abar, sigma)
+datplot <- post %>%
+		   sample_n(1000)
+
+# side-by-side plots
+par(mfrow = c(1, 2))
+
+# log odds plot for 1000 samples
+plot(NULL, xlim = c(-3, 4), ylim = c(0, .35),
+     xlab = 'Log-odds survive', ylab = 'Density')
+for (i in 1:nrow(datplot)) {
+    curve(dnorm(x, datplot$abar[i], datplot$sigma[i]), add = TRUE,
+          col = adjustcolor('black', alpha = .02))
+}
+
+# density plot
+sim_tanks <- rnorm(1:nrow(post), post$abar, post$sigma)
+sim_tanks <- density(rethinking::inv_logit(sim_tanks))
+plot(sim_tanks, lwd = 2, adj = .1, xlab = 'Probability survive', main = '')
+```
+
+Results are different because of different random seeds. This model replicates the same results produced by the book's replication code:
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+set.seed(5005)
+a_bar <- 1.5
+sigma <- 1.5
+nponds <- 60
+Ni <- as.integer(rep(c(5, 10, 25, 35), each = 15))
+a_pond <- rnorm(nponds, mean = a_bar, sd = sigma)
+dsim <- data.frame(pond = 1:nponds,
+                   Ni = Ni,
+                   true_a = a_pond)
+dsim$Si <- rbinom(nponds, prob = logistic(dsim$true_a), size = dsim$Ni)
+dsim$p_nopool <- dsim$Si / dsim$Ni
+stan_data <- compose_data(dsim)
+stan_data$n_pond <- n_distinct(stan_data$pond)
+
+stan_program <- "
+data {
+    int n;
+    int n_pond;
+    int Si[n];
+    int Ni[n];
+    int pond[n];
+}
+parameters {
+    real a_pond[n_pond];
+    real a_bar;
+    real<lower=0> sigma;
+}
+model {
+    vector[n] p;
+    for (i in 1:n) {
+        p[i] = inv_logit(a_pond[pond[i]]);
+    }
+    Si ~ binomial(Ni, p);
+    a_pond ~ normal(a_bar, sigma);
+    a_bar ~ normal(0, 1.5);
+    sigma ~ exponential(1);
+}
+"
+
+m13.3 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m13.3, c('a_bar', 'sigma'))$summary
+```
+
+
+```
+
+# Section 13.3: More than one type of cluster
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+dat <- read.csv('data/chimpanzees.csv', sep = ';')
+stan_data <- list(actor = dat$actor,
+                  treatment = as.integer(1 + dat$prosoc_left + 2 * dat$condition),
+                  pulled_left = dat$pulled_left,
+                  block_id = dat$block,
+                  n = nrow(dat),
+                  n_block_id = length(unique(dat$block)))
+stan_data$n_treatment <- length(unique(stan_data$treatment))
+
+stan_program <- '
+data {
+    int n;
+    int n_block_id;
+    int n_treatment;
+    int actor[n];
+    int treatment[n];
+    int pulled_left[n];
+    int block_id[n];
+}
+parameters {
+    vector[n] a;
+    vector[n_block_id] g;
+    vector[n_treatment] b;
+    real a_bar;
+    real<lower=0> sigma_a;
+    real<lower=0> sigma_g;
+}
+transformed parameters {
+    vector[n] p;
+    for (i in 1:n) {
+        p[i] = inv_logit(a[actor[i]] + g[block_id[i]] + b[treatment[i]]);
+    }
+}
+model {
+    a_bar ~ normal(0, 1.5);
+    a ~ normal(a_bar, sigma_a);
+    b ~ normal(0, 0.5);
+    g ~ normal(0, sigma_g);
+    sigma_a ~ exponential(1);
+    sigma_g ~ exponential(1);
+    pulled_left ~ binomial(1, p);
+}
+'
+
+m13.4 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m13.4, c('a_bar', 'sigma_a', 'sigma_g'))$summary
+```
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+stan_program <- '
+data {
+    int n;
+    int n_block_id;
+    int n_treatment;
+    int actor[n];
+    int treatment[n];
+    int pulled_left[n];
+    int block_id[n];
+}
+parameters {
+    vector[n] a;
+    vector[n_block_id] g;
+    vector[n_treatment] b;
+    real a_bar;
+    real<lower=0> sigma_a;
+    real<lower=0> sigma_g;
+}
+transformed parameters {
+    vector[n] p;
+    p = inv_logit(a[actor] + b[treatment]);
+}
+model {
+    a_bar ~ normal(0, 1.5);
+    a ~ normal(a_bar, sigma_a);
+    b ~ normal(0, 0.5);
+    g ~ normal(0, sigma_g);
+    sigma_a ~ exponential(1);
+    sigma_g ~ exponential(1);
+    pulled_left ~ binomial(1, p);
+}
+'
+
+m13.5 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m13.5, c('a_bar', 'sigma_a', 'sigma_g', 'g', 'b'))$summary
+```
+
+```{r, results=FALSE, message=FALSE, warning = FALSE}
+stan_program <- '
+data {
+    int n;
+    int n_block_id;
+    int n_treatment;
+    int actor[n];
+    int treatment[n];
+    int pulled_left[n];
+    int block_id[n];
+}
+parameters {
+    vector[n] a;
+    vector[n_block_id] g;
+    vector[n_treatment] b;
+    real a_bar;
+    real<lower=0> sigma_a;
+    real<lower=0> sigma_g;
+    real<lower=0> sigma_b;
+}
+transformed parameters {
+    vector[n] p;
+    p = inv_logit(a[actor] + g[block_id] + b[treatment]);
+}
+model {
+    a_bar ~ normal(0, 1.5);
+    a ~ normal(a_bar, sigma_a);
+    b ~ normal(0, sigma_b);
+    g ~ normal(0, sigma_g);
+    sigma_a ~ exponential(1);
+    sigma_g ~ exponential(1);
+    sigma_b ~ exponential(1);
+    pulled_left ~ binomial(1, p);
+}
+'
+
+m13.6 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m13.6, c('a_bar', 'sigma_a', 'sigma_g', 'sigma_b', 'g', 'b'))$summary
+```
+
+# Section 13: Divergent transitions and non-centered priors
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+stan_program <- '
+data {
+  int n;
+}
+parameters {
+  real v;
+  real x;
+}
+model {
+  x ~ normal(0, exp(v));
+  v ~ normal(0, 3);
+}
+'
+stan_data <- list(n = 1)
+m13.7 <- stan(model_code = stan_program, data = stan_data)
+```
+```{r}
+m13.7
+```
+
+```{r, results=FALSE, message=FALSE, warning=FALSE}
+stan_program <- '
+data {
+  int n;
+}
+parameters {
+  real v;
+  real z;
+}
+model {
+  z ~ normal(0, 1);
+  v ~ normal(0, 3);
+}
+generated quantities {
+  real x;
+  x = z * exp(v);
+}
+'
+
+m13.7nc <- stan(model_code = stan_program, data = stan_data, iter = 5000)
+```
+
+```{r}
+m13.7nc
+```
+
+```{r, results=FALSE, message=FALSE}
+stan_program <- '
+data {
+    int n;
+    int n_block_id;
+    int n_treatment;
+    int n_actor;
+    int actor[n];
+    int treatment[n];
+    int pulled_left[n];
+    int block_id[n];
+}
+parameters {
+  vector[n_treatment] b;
+  vector[n_actor] z;
+  vector[n_block_id] x;
+  real<lower=0> sigma_a;
+  real<lower=0> sigma_g;
+  real abar;
+}
+transformed parameters {
+  vector[n] a;
+  vector[n] g;
+  vector[n] p;
+  for (i in 1:n) {
+      a[i] = abar + z[actor[i]] * sigma_a;
+      g[i] = x[block_id[i]] * sigma_g;
+      p[i] = a[i] + g[i] + b[treatment[i]];
+      p[i] = inv_logit(p[i]);
+  }
+}
+model {
+  pulled_left ~ binomial(1, p);
+  b ~ normal(0, 0.5);
+  z ~ normal(0, 1);
+  x ~ normal(0, 1);
+  abar ~ normal(0, 1.5);
+  sigma_a ~ exponential(1);
+  sigma_g ~ exponential(1);
+}
+'
+
+dat <- read.csv('data/chimpanzees.csv', sep = ';')
+stan_data <- list(actor = dat$actor,
+                  treatment = as.integer(1 + dat$prosoc_left + 2 * dat$condition),
+                  pulled_left = dat$pulled_left,
+                  block_id = dat$block,
+                  n = nrow(dat),
+                  n_block_id = length(unique(dat$block)),
+                  n_actor = length(unique(dat$actor)))
+stan_data$n_treatment <- length(unique(stan_data$treatment))
+
+
+m13.4nc <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m13.4nc, c('b', 'abar', 'sigma_a', 'sigma_g'))$summary
+```
+
+

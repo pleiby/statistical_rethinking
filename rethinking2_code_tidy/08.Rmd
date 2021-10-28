@@ -1,0 +1,319 @@
+---
+title: "Statistical Rethinking 2: Chapter 8"
+author: Vincent Arel-Bundock
+output: html_document
+---
+
+# Status
+
+Estimated and checked against the book:
+
+* m8.1
+* m8.2
+* m8.3
+* m8.4
+* m8.5
+
+# Libraries
+
+```{r, include=FALSE}
+# set default graphics theme if Vincent's personal package is installed
+if (requireNamespace('vincent', quietly = TRUE)) {
+    vincent::theming()
+}
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE} 
+library(tidyverse)
+library(tidybayes)
+library(rstan)
+library(patchwork)
+options(mc.cores = parallel::detectCores())
+```
+
+# Section 8.1: Building an interaction
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+rugged <- read.csv('data/rugged.csv', sep = ';') %>%
+          mutate(log_gdp = log(rgdppc_2000),
+                 log_gdp_std = log_gdp / mean(log_gdp, na.rm = TRUE),
+                 rugged_std = rugged / max(rugged, na.rm = TRUE),
+                 cid = ifelse(cont_africa == 1, 1, 2),
+                 Region = ifelse(cont_africa == 1, 'Africa', 'Not Africa')) %>%
+          select(country, log_gdp_std, rugged_std, Region, cid) %>%
+          filter(!is.na(log_gdp_std))
+
+stan_data <- rugged %>% compose_data
+stan_data$x_new <- seq(min(rugged$rugged_std), max(rugged$rugged_std), length.out = 100)
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+stan_program <- '
+data {
+  int<lower=1> n;        // number of observations
+  vector[n] log_gdp_std; // outcome
+  vector[n] rugged_std;  // regressor
+  vector[100] x_new;     // prediction x
+  int cid[n];            // africa indicator
+}
+parameters {
+  real<lower=0> sigma;
+  real a;
+  real b;
+}
+transformed parameters {
+  vector[n] mu;                    // location
+  mu = a + b * (rugged_std - 0.215);
+}
+model {
+  log_gdp_std ~ normal(mu, sigma);
+  sigma ~ exponential(1);
+  a ~ normal(1, 0.1);
+  b ~ normal(0, 0.3);
+}
+generated quantities {
+  matrix[100, 2] yhat;
+  for (i in 1:100) {
+    for (j in 1:2) {
+      yhat[i, j] = a + b * (x_new[i] - 0.215);
+    }
+  }
+}
+'
+
+m8.1 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m8.1, c('a', 'b', 'sigma'))$ summary
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+stan_program <- '
+data {
+  int<lower=1> n;        // number of observations
+  vector[n] log_gdp_std; // outcome
+  vector[n] rugged_std;  // regressor
+  vector[100] x_new;     // prediction x
+  int cid[n];            // africa indicator
+}
+parameters {
+  real<lower=0> sigma;
+  vector[2] a;
+  real b;
+}
+transformed parameters {
+  vector[n] mu;                    // location
+  mu = a[cid] + b * (rugged_std - 0.215);
+}
+model {
+  log_gdp_std ~ normal(mu, sigma);
+  sigma ~ exponential(1);
+  a ~ normal(1, 0.1);
+  b ~ normal(0, 0.3);
+}
+generated quantities {
+  matrix[100, 2] yhat;
+  for (i in 1:100) {
+    for (j in 1:2) {
+      yhat[i, j] = a[j] + b * (x_new[i] - 0.215);
+    }
+  }
+}
+'
+
+m8.2 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m8.2, c('a', 'b', 'sigma'))$ summary
+```
+
+```{r}
+
+datplot <- m8.2 %>% 
+           spread_draws(yhat[i, j]) %>%
+           median_qi() %>%
+           left_join(tibble(i = 1:100, ruggedness = stan_data$x_new), by = 'i') %>%
+           mutate(Region = ifelse(j == 1, 'Africa', 'Not Africa'))
+
+ggplot(datplot) + 
+    geom_ribbon(aes(x = ruggedness, ymax = .upper, ymin = .lower, fill = Region), alpha = .1) +
+    geom_line(aes(x = ruggedness, y = yhat, color = Region)) +
+    geom_point(data = rugged, aes(rugged_std, log_gdp_std, color = Region)) +
+    labs(x = 'Ruggedness (standardized)',
+         y = 'log GDP (as proportion of mean)',
+         color = '', fill = '')
+```
+
+
+```{r, warning=FALSE, message=FALSE, results=FALSE}
+stan_program <- '
+data {
+  int<lower=1> n;        // number of observations
+  vector[n] log_gdp_std; // outcome
+  vector[n] rugged_std;  // regressor
+  vector[100] x_new;     // prediction x
+  int cid[n];            // africa indicator
+}
+parameters {
+  real<lower=0> sigma;
+  vector[2] a;
+  vector[2] b;
+}
+transformed parameters {
+  vector[n] mu;                    // location
+  for (i in 1:n) {
+    mu[i] = a[cid[i]] + b[cid[i]] * (rugged_std[i] - 0.215);
+  }
+}
+model {
+  log_gdp_std ~ normal(mu, sigma);
+  sigma ~ exponential(1);
+  a ~ normal(1, 0.1);
+  b ~ normal(0, 0.3);
+}
+generated quantities {
+  matrix[100, 2] yhat;
+  for (i in 1:100) {
+    for (j in 1:2) {
+      yhat[i, j] = a[j] + b[j] * (x_new[i] - 0.215);
+    }
+  }
+}
+'
+
+m8.3 <- stan(model_code = stan_program, data = stan_data)
+```
+
+```{r}
+summary(m8.3, c('a', 'b', 'sigma'))$ summary
+```
+
+```{r}
+datplot <- m8.3 %>% 
+           spread_draws(yhat[i, j]) %>%
+           median_qi() %>%
+           left_join(tibble(i = 1:100, ruggedness = stan_data$x_new), by = 'i') %>%
+           mutate(Region = ifelse(j == 1, 'Africa', 'Not Africa'))
+
+ggplot(datplot) + 
+    geom_ribbon(aes(x = ruggedness, ymax = .upper, ymin = .lower, fill = Region), alpha = .1) +
+    geom_line(aes(x = ruggedness, y = yhat, color = Region)) +
+    geom_point(data = rugged, aes(rugged_std, log_gdp_std, color = Region)) +
+    labs(x = 'Ruggedness (standardized)',
+         y = 'log GDP (as proportion of mean)',
+         color = '', fill = '')
+```
+
+# Section 8.3: Continuous interactions
+
+```{r, warning=FALSE, message=FALSE, results=FALSE, out.width='100%', fig.asp = .4}
+tulips <- read.csv('data/tulips.csv', sep = ';') %>%
+          mutate(blooms_std = blooms / max(blooms),
+                 water_cent = water - mean(water),
+                 shade_cent = shade - mean(shade))
+stan_data <- compose_data(tulips)
+stan_data$pred <- expand_grid(water_cent = c(-1:1),
+                        shade_cent = c(-1:1))
+stan_data$pred_n <- nrow(stan_data$pred)
+
+stan_program <- '
+data {
+  int<lower=1> n;      
+  vector[n] blooms_std; 
+  vector[n] water_cent; 
+  vector[n] shade_cent; 
+  int<lower=1> pred_n;
+  matrix[pred_n, 2] pred;
+}
+parameters {
+  real<lower=0> sigma;
+  real a;
+  real bw;
+  real bs;
+}
+transformed parameters {
+  vector[n] mu;
+  mu = a + bw * water_cent + bs * shade_cent;
+}
+model {
+  blooms_std ~ normal(mu, sigma);
+  sigma ~ exponential(1);
+  bw ~ normal(0, 0.25);
+  bs ~ normal(0, 0.25);
+}
+generated quantities {
+  vector[pred_n] yhat;
+  for (i in 1:pred_n) {
+    yhat[i] = a + bw * pred[i, 1] + bs * pred[i, 2];
+  }
+}
+'
+
+m8.4 <- stan(model_code = stan_program, data = stan_data)#, control = list(adapt_delta = 0.99), iter = 10000)
+
+pred <- stan_data$pred
+pred$i <- 1:nrow(pred)
+datplot <- m8.4 %>% 
+           spread_draws(yhat[i]) %>%
+           mean_qi() %>%
+           left_join(pred, by = 'i')
+ggplot(datplot, aes(water_cent, yhat, ymin = .lower, ymax = .upper)) +
+    geom_pointrange() +
+    facet_grid(.~shade_cent) +
+    theme_classic() +
+    labs(x = 'Water', y = 'Predicted blooms')
+```
+
+```{r, warning=FALSE, message=FALSE, results=FALSE, out.width='100%', fig.asp = .4}
+stan_program <- '
+data {
+  int<lower=1> n;      
+  vector[n] blooms_std; 
+  vector[n] water_cent; 
+  vector[n] shade_cent; 
+  int<lower=1> pred_n;
+  matrix[pred_n, 2] pred;
+}
+parameters {
+  real<lower=0> sigma;
+  real a;
+  real bw;
+  real bs;
+  real bws;
+}
+transformed parameters {
+  vector[n] mu;
+  mu = a + bw * water_cent + bs * shade_cent + bws * water_cent .* shade_cent;
+}
+model {
+  blooms_std ~ normal(mu, sigma);
+  sigma ~ exponential(1);
+  bw ~ normal(0, 0.25);
+  bs ~ normal(0, 0.25);
+  bws ~ normal(0, 0.25);
+}
+generated quantities {
+  vector[pred_n] yhat;
+  for (i in 1:pred_n) {
+    yhat[i] = a + bw * pred[i, 1] + bs * pred[i, 2] + bws * pred[i, 1] * pred[i, 2];
+  }
+}
+'
+
+m8.5 <- stan(model_code = stan_program, data = stan_data)
+
+pred <- stan_data$pred
+pred$i <- 1:nrow(pred)
+datplot <- m8.5 %>% 
+           spread_draws(yhat[i]) %>%
+           mean_qi() %>%
+           left_join(pred, by = 'i')
+ggplot(datplot, aes(water_cent, yhat, ymin = .lower, ymax = .upper)) +
+    geom_pointrange() +
+    facet_grid(.~shade_cent) +
+    theme_classic() +
+    labs(x = 'Water', y = 'Predicted blooms')
+```
+
